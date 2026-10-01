@@ -6188,10 +6188,9 @@ async fn delete_model(
     let path = effective_models_dir().join(format!("{}.rvf", safe_id));
     if path.exists() {
         if let Err(e) = std::fs::remove_file(&path) {
-            // ADR-080 #2: log the OS error (incl. path) server-side only; the
-            // client gets a generic body + correlation id, no leaked path.
             return error_response::internal_error_json("model delete", e);
         }
+        info!("Model file deleted by exact id: {}", path.display());
         // If this was the active model, unload it
         let mut s = state.write().await;
         if s.active_model_id.as_deref() == Some(id.as_str()) {
@@ -6201,10 +6200,35 @@ async fn delete_model(
         s.discovered_models
             .retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
         info!("Model deleted: {id}");
-        Json(serde_json::json!({ "success": true, "deleted": id }))
-    } else {
-        Json(serde_json::json!({ "error": "model not found", "success": false }))
+        return Json(serde_json::json!({ "success": true, "deleted": id }));
     }
+
+    // Fallback: try prefix match in the models directory (handles truncated
+    // or UI-displayed short ids). Delete the first matching .rvf file.
+    if let Ok(entries) = std::fs::read_dir(effective_models_dir()) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("rvf") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    if stem.starts_with(safe_id) {
+                        if let Err(e) = std::fs::remove_file(&p) {
+                            return error_response::internal_error_json("model delete", e);
+                        }
+                        info!("Model file deleted by prefix match: {} -> {}", safe_id, p.display());
+                        let mut s = state.write().await;
+                        if s.active_model_id.as_deref() == Some(stem) {
+                            s.active_model_id = None;
+                            s.model_loaded = false;
+                        }
+                        s.discovered_models
+                            .retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(stem));
+                        return Json(serde_json::json!({ "success": true, "deleted": stem }));
+                    }
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "error": "model not found", "success": false }))
 }
 
 /// GET /api/v1/models/lora/profiles — list LoRA adapter profiles.
@@ -6232,7 +6256,20 @@ async fn activate_lora_profile(Json(body): Json<serde_json::Value>) -> Json<serd
 /// Return the effective models directory, respecting the `MODELS_DIR`
 /// environment variable.  Defaults to `data/models`.
 fn effective_models_dir() -> PathBuf {
-    PathBuf::from(std::env::var("MODELS_DIR").unwrap_or_else(|_| "data/models".to_string()))
+    // Honor explicit override first.
+    if let Ok(dir) = std::env::var("MODELS_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    // If running from the repository root, the models live under `v2/data/models`.
+    // Prefer that path when it exists to avoid 404s caused by a different cwd.
+    let repo_v2_candidate = PathBuf::from("v2").join("data").join("models");
+    if repo_v2_candidate.exists() {
+        return repo_v2_candidate;
+    }
+
+    // Fall back to the original default (cwd relative `data/models`).
+    PathBuf::from("data/models")
 }
 
 /// Scan the models directory for `.rvf` files and return metadata.
@@ -6470,17 +6507,38 @@ async fn delete_recording(
     let path = PathBuf::from("data/recordings").join(format!("{}.jsonl", safe_id));
     if path.exists() {
         if let Err(e) = std::fs::remove_file(&path) {
-            // ADR-080 #2: log the OS error (incl. path) server-side only.
             return error_response::internal_error_json("recording delete", e);
         }
         let mut s = state.write().await;
         s.recordings
             .retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
         info!("Recording deleted: {id}");
-        Json(serde_json::json!({ "success": true, "deleted": id }))
-    } else {
-        Json(serde_json::json!({ "error": "recording not found", "success": false }))
+        return Json(serde_json::json!({ "success": true, "deleted": id }));
     }
+
+    // Fallback: prefix match recording filenames in recordings dir.
+    let rec_dir = PathBuf::from("data/recordings");
+    if let Ok(entries) = std::fs::read_dir(&rec_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    if stem.starts_with(safe_id) {
+                        if let Err(e) = std::fs::remove_file(&p) {
+                            return error_response::internal_error_json("recording delete", e);
+                        }
+                        let mut s = state.write().await;
+                        s.recordings
+                            .retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(stem));
+                        info!("Recording deleted by prefix match: {} -> {}", safe_id, p.display());
+                        return Json(serde_json::json!({ "success": true, "deleted": stem }));
+                    }
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "error": "recording not found", "success": false }))
 }
 
 /// Scan `data/recordings/` for `.jsonl` files and return metadata.
